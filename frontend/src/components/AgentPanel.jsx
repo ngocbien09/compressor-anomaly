@@ -200,7 +200,7 @@ export default function AgentPanel() {
     esRef.current = es
     let buffer = ''
 
-    es.onmessage = (e) => {
+    es.onmessage = async (e) => {
       try {
         const { chunk } = JSON.parse(e.data)
         if (!chunk) return
