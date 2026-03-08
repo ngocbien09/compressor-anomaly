@@ -1,12 +1,27 @@
 """
 Agentic AI layer using Anthropic Claude API for anomaly explanation and triage.
+Supports: structured analysis, streaming tokens, multi-turn chat.
 Falls back to mock response when API key is not set.
 """
 
 import os
 import json
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Generator
+
+# Load .env from project root if present
+try:
+    from pathlib import Path
+    _env = Path(__file__).resolve().parents[2] / ".env"
+    if _env.exists():
+        for _line in _env.read_text().splitlines():
+            if "=" in _line and not _line.startswith("#"):
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+except Exception:
+    pass
+
+MODEL = "claude-sonnet-4-6"
 
 SYSTEM_PROMPT = """You are an expert rotating equipment engineer specializing in centrifugal compressor diagnostics.
 Analyze anomaly detection results from a Multi-Stage Compressor and provide:
@@ -109,13 +124,144 @@ def _mock_response(severity: str, affected_sensors: Dict) -> Dict[str, Any]:
         "root_cause": root_cause,
         "root_cause_detail": detail,
         "confidence": "Medium" if severity in ("MEDIUM", "HIGH") else "Low",
-        "confidence_reasoning": "Mock analysis - Claude API key not configured",
+        "confidence_reasoning": "Rule-based analysis — Claude AI available once account has credits",
         "affected_systems": sensor_names[:4] if sensor_names else ["Unknown"],
         "recommended_actions": actions,
         "time_to_critical": ttc,
-        "additional_notes": "This is a mock response. Set ANTHROPIC_API_KEY for AI-powered analysis.",
+        "additional_notes": "Rule-based fallback response. Add Anthropic credits to enable Claude AI-powered analysis.",
         "is_mock": True,
     }
+
+
+STREAM_SYSTEM_PROMPT = """You are CompressorGuard AI — an expert rotating-equipment engineer specializing in centrifugal compressor diagnostics.
+When given sensor anomaly data, produce a clear, structured engineering diagnosis.
+
+Format your response with these sections:
+## Root Cause
+Brief hypothesis (1-2 sentences).
+
+## Evidence
+Bullet points linking specific sensor readings to the diagnosis.
+
+## Risk Assessment
+Severity + estimated time to critical failure if untreated.
+
+## Recommended Actions
+Numbered list with urgency tags [IMMEDIATE] [4H] [24H] [MONITOR].
+
+## Additional Notes
+Any other relevant observations.
+
+Be technical, specific, and actionable. Reference actual sensor values in your analysis."""
+
+CHAT_SYSTEM_PROMPT = """You are CompressorGuard AI — an expert rotating-equipment engineer for centrifugal compressors.
+You have already analyzed an anomaly for this user. Answer their follow-up questions clearly and technically.
+Reference the anomaly context when relevant. Keep answers concise and actionable."""
+
+
+def stream_analyze_anomaly(anomaly_data: Dict[str, Any]) -> Generator[str, None, None]:
+    """
+    Stream Claude's analysis as text tokens via a generator.
+    Yields: 'data:text:<chunk>', then 'data:done:<json_structured>'
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    severity = anomaly_data.get("severity", "LOW")
+    affected_sensors = anomaly_data.get("affected_sensors", {})
+
+    if not api_key:
+        mock = _mock_response(severity, affected_sensors)
+        text = f"## Root Cause\n{mock['root_cause']}\n\n{mock['root_cause_detail']}\n\n"
+        text += "## Recommended Actions\n"
+        for a in mock["recommended_actions"]:
+            text += f"- [{a['urgency'].upper()}] {a['action']}\n"
+        text += f"\n## Time to Critical\n{mock['time_to_critical']}"
+        for ch in text:
+            yield f"text:{ch}"
+        yield f"done:{json.dumps(mock)}"
+        return
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+
+        affected_text = _format_affected_sensors(affected_sensors)
+        user_msg = USER_PROMPT_TEMPLATE.format(
+            anomaly_timestamp=anomaly_data.get("anomaly_timestamp", datetime.utcnow().isoformat()),
+            severity=severity,
+            anomaly_score=anomaly_data.get("anomaly_score", 0.0),
+            if_score=anomaly_data.get("if_score", 0.0),
+            lstm_reconstruction_error=anomaly_data.get("lstm_reconstruction_error", 0.0),
+            previous_anomalies_24h=anomaly_data.get("previous_anomalies_24h", 0),
+            recent_trend=anomaly_data.get("recent_trend", "No trend data"),
+            affected_sensors_text=affected_text,
+        )
+
+        full_text = ""
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=1200,
+            system=STREAM_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+        ) as stream:
+            for chunk in stream.text_stream:
+                full_text += chunk
+                yield f"text:{chunk}"
+
+        # After streaming completes, also call structured analysis silently
+        structured = analyze_anomaly(anomaly_data)
+        structured["stream_text"] = full_text
+        yield f"done:{json.dumps(structured)}"
+
+    except Exception as e:
+        err = str(e)
+        if "credit balance" in err or "insufficient" in err.lower():
+            yield "error:Anthropic account needs credits. Add credits at console.anthropic.com → Billing, then retry."
+        else:
+            yield f"error:{err}"
+
+
+def stream_chat(messages: List[Dict], anomaly_context: Dict[str, Any]) -> Generator[str, None, None]:
+    """
+    Stream a chat turn. messages = [{role, content}, ...] full history.
+    Yields text chunks then 'done:'.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        yield "text:API key not configured. Please set ANTHROPIC_API_KEY."
+        yield "done:{}"
+        return
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+
+        # Inject anomaly context into the system prompt
+        affected = _format_affected_sensors(anomaly_context.get("affected_sensors", {}))
+        context_note = (
+            f"\n\nCurrent anomaly context:\n"
+            f"Severity: {anomaly_context.get('severity','?')} | "
+            f"Score: {anomaly_context.get('anomaly_score',0):.2f} | "
+            f"Time: {anomaly_context.get('anomaly_timestamp','?')}\n"
+            f"Sensors:\n{affected}"
+        )
+
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=800,
+            system=CHAT_SYSTEM_PROMPT + context_note,
+            messages=messages,
+        ) as stream:
+            for chunk in stream.text_stream:
+                yield f"text:{chunk}"
+
+        yield "done:{}"
+
+    except Exception as e:
+        err = str(e)
+        if "credit balance" in err or "insufficient" in err.lower():
+            yield "error:Anthropic account needs credits. Add credits at console.anthropic.com → Billing, then retry."
+        else:
+            yield f"error:{err}"
 
 
 def analyze_anomaly(anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -148,7 +294,7 @@ def analyze_anomaly(anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         message = client.messages.create(
-            model="claude-sonnet-4-5",
+            model=MODEL,
             max_tokens=1024,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],

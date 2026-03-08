@@ -13,6 +13,15 @@ from typing import Any, Dict, List, Optional
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Load .env from project root
+_env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            if "=" in _line and not _line.startswith("#"):
+                _k, _v = _line.strip().split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -326,34 +335,77 @@ async def predict_batch(file: UploadFile = File(...), db=Depends(get_db)):
 
 @app.get("/api/predict/stream")
 async def stream_predictions():
-    """Server-Sent Events stream for real-time simulation."""
+    """Server-Sent Events stream: Normal operation → gradual fault → full anomaly."""
+    import random, math
     predictor = get_predictor()
 
+    # ── Sensor baselines (healthy compressor) ─────────────────────────────────
+    BASELINES = {
+        "suction_pressure": 1.0,    "discharge_pressure": 8.75,
+        "suction_temperature": 30.0, "discharge_temperature": 95.0,
+        "vibration_x": 2.25,        "vibration_y": 2.25,
+        "bearing_temperature": 55.0, "motor_current": 50.0,
+        "flow_rate": 1000.0,        "oil_pressure": 3.25,
+    }
+    NOISE = {
+        "suction_pressure": 0.02,   "discharge_pressure": 0.05,
+        "suction_temperature": 0.3,  "discharge_temperature": 0.5,
+        "vibration_x": 0.08,        "vibration_y": 0.08,
+        "bearing_temperature": 0.3,  "motor_current": 0.4,
+        "flow_rate": 5.0,           "oil_pressure": 0.03,
+    }
+
+    # ── Fault scenario: bearing wear leading to failure ───────────────────────
+    # Each phase: (phase_name, n_steps, {sensor: total_delta_by_end_of_phase})
+    SCENARIO = [
+        ("NORMAL",      60,  {}),                             # 30 s normal
+        ("PRE_ANOMALY", 100, {                                # 50 s gradual drift
+            "vibration_x": 2.5,  "vibration_y": 2.0,
+            "bearing_temperature": 18.0, "motor_current": 5.0,
+            "discharge_temperature": 8.0,
+        }),
+        ("ANOMALY",     80, {                                 # 40 s critical fault
+            "vibration_x": 6.5,  "vibration_y": 5.5,
+            "bearing_temperature": 40.0, "motor_current": 18.0,
+            "discharge_temperature": 22.0,
+            "oil_pressure": -1.1, "flow_rate": -180.0,
+            "discharge_pressure": -1.5,
+        }),
+    ]
+
     async def event_generator():
-        if not os.path.exists(DATA_PATH):
-            yield f"data: {json.dumps({'error': 'Dataset not found'})}\n\n"
-            return
+        step = 0
+        cumulative_deltas = {s: 0.0 for s in BASELINES}
 
-        df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
-        FEATURES = [
-            "suction_pressure", "discharge_pressure", "suction_temperature",
-            "discharge_temperature", "vibration_x", "vibration_y",
-            "bearing_temperature", "motor_current", "flow_rate", "oil_pressure",
-        ]
-        # Pick a window of interesting data (around anomalies)
-        start_idx = int(len(df) * 0.45)
-        end_idx = min(start_idx + 600, len(df))
+        for phase_name, n_steps, target_deltas in SCENARIO:
+            for i in range(n_steps):
+                progress = i / max(n_steps - 1, 1)          # 0 → 1 within phase
 
-        for i in range(start_idx, end_idx):
-            row = df.iloc[i]
-            sensor_values = {f: float(row[f]) for f in FEATURES}
-            result = predictor.predict_single(sensor_values)
-            result["true_label"] = int(row.get("label", 0))
-            result["event_type"] = str(row.get("event_type", "NORMAL"))
-            result["row_index"] = i
+                sensor_values = {}
+                for sensor, base in BASELINES.items():
+                    phase_delta = target_deltas.get(sensor, 0.0) * progress
+                    total = cumulative_deltas[sensor] + phase_delta
+                    noise = random.gauss(0, NOISE[sensor])
+                    sensor_values[sensor] = round(base + total + noise, 4)
 
-            yield f"data: {json.dumps(result)}\n\n"
-            await asyncio.sleep(0.5)  # 0.5s per point = 2 points/sec
+                result = predictor.predict_single(sensor_values)
+                result["phase"]          = phase_name
+                result["phase_step"]     = i
+                result["phase_total"]    = n_steps
+                result["phase_progress"] = round(progress, 3)
+                result["true_label"]     = 0 if phase_name == "NORMAL" else 1
+                result["event_type"]     = phase_name
+                result["step"]           = step
+
+                yield f"data: {json.dumps(result)}\n\n"
+                await asyncio.sleep(0.5)
+                step += 1
+
+            # Carry forward deltas from this phase into the next
+            for sensor, delta in target_deltas.items():
+                cumulative_deltas[sensor] += delta
+
+        yield f"data: {json.dumps({'done': True})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -401,6 +453,65 @@ def agent_analyze(request: AnomalyAnalysisRequest, db=Depends(get_db)):
     })
 
     return {**analysis, "analysis_id": db_analysis.id}
+
+
+@app.get("/api/agent/stream")
+async def agent_stream(
+    severity: str = "MEDIUM",
+    anomaly_score: float = 0.6,
+    if_score: float = 0.55,
+    lstm_error: float = 0.015,
+    previous_anomalies_24h: int = 0,
+    recent_trend: str = "Gradual increase over last 60 minutes",
+    sensors: str = "{}",
+):
+    """SSE endpoint: streams Claude analysis token by token."""
+    from backend.agent.analyzer import stream_analyze_anomaly
+
+    try:
+        affected_sensors = json.loads(sensors)
+    except Exception:
+        affected_sensors = {}
+
+    anomaly_data = {
+        "anomaly_timestamp": datetime.utcnow().isoformat(),
+        "severity": severity,
+        "anomaly_score": anomaly_score,
+        "if_score": if_score,
+        "lstm_reconstruction_error": lstm_error,
+        "affected_sensors": affected_sensors,
+        "previous_anomalies_24h": previous_anomalies_24h,
+        "recent_trend": recent_trend,
+    }
+
+    async def event_gen():
+        import asyncio
+        for chunk in stream_analyze_anomaly(anomaly_data):
+            yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+            await asyncio.sleep(0)   # yield control to event loop
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+class ChatRequest(BaseModel):
+    messages: List[Dict[str, Any]]
+    anomaly_context: Dict[str, Any] = {}
+
+
+@app.post("/api/agent/chat")
+async def agent_chat(request: ChatRequest):
+    """SSE endpoint: streams a chat reply token by token."""
+    from backend.agent.analyzer import stream_chat
+
+    async def event_gen():
+        import asyncio
+        for chunk in stream_chat(request.messages, request.anomaly_context):
+            yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+            await asyncio.sleep(0)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/agent/history")

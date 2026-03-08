@@ -1,243 +1,476 @@
-import { useState, useEffect } from 'react'
-import { Brain, Loader2, RefreshCw, AlertTriangle, Clock, Zap, CheckCircle, Info } from 'lucide-react'
-import { analyzeAnomaly, getAgentHistory, getRecentPredictions } from '../services/api'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import {
+  Brain, Loader2, RefreshCw, AlertTriangle, Clock, Zap,
+  CheckCircle, Send, User, Bot, Trash2, ChevronDown, ChevronUp,
+} from 'lucide-react'
+import { getAgentHistory, getRecentPredictions } from '../services/api'
 
-const urgencyColor = {
-  Immediate:      'text-red-400 bg-red-900/20 border-red-800',
-  'Within 4h':    'text-orange-400 bg-orange-900/20 border-orange-800',
-  'Within 24h':   'text-yellow-400 bg-yellow-900/20 border-yellow-800',
-  Monitor:        'text-blue-400 bg-blue-900/20 border-blue-800',
+// ── Markdown-lite renderer ────────────────────────────────────────────────────
+function Markdown({ text }) {
+  if (!text) return null
+  const lines = text.split('\n')
+  return (
+    <div className="space-y-1 text-sm text-gray-300 leading-relaxed">
+      {lines.map((line, i) => {
+        if (line.startsWith('## '))
+          return <p key={i} className="text-white font-semibold mt-3 mb-1 text-base">{line.slice(3)}</p>
+        if (line.startsWith('# '))
+          return <p key={i} className="text-white font-bold mt-3 mb-1 text-lg">{line.slice(2)}</p>
+        if (line.match(/^\d+\./))
+          return <p key={i} className="ml-3">• {line.replace(/^\d+\.\s*/, '')}</p>
+        if (line.startsWith('- ') || line.startsWith('* '))
+          return <p key={i} className="ml-3">• {line.slice(2)}</p>
+        if (line.trim() === '')
+          return <div key={i} className="h-1" />
+        return <p key={i}>{line}</p>
+      })}
+    </div>
+  )
 }
 
-const confidenceColor = {
+// ── Urgency / confidence colours ──────────────────────────────────────────────
+const urgencyColor = {
+  Immediate:    'text-red-400 bg-red-900/20 border-red-800',
+  'Within 4h':  'text-orange-400 bg-orange-900/20 border-orange-800',
+  'Within 24h': 'text-yellow-400 bg-yellow-900/20 border-yellow-800',
+  Monitor:      'text-blue-400 bg-blue-900/20 border-blue-800',
+}
+const confColor = {
   High:   'text-green-400 bg-green-900/30 border-green-700',
   Medium: 'text-yellow-400 bg-yellow-900/30 border-yellow-700',
   Low:    'text-gray-400 bg-gray-800 border-gray-700',
 }
 
-function AnalysisCard({ analysis }) {
-  const actions = analysis.recommended_actions || analysis.recommendations || []
+// ── Structured result card ────────────────────────────────────────────────────
+function StructuredCard({ data, collapsible }) {
+  const [open, setOpen] = useState(!collapsible)
+  if (!data) return null
+  const actions = data.recommended_actions || []
   return (
-    <div className="card space-y-4 border-gray-700">
-      <div className="flex items-start justify-between gap-3 flex-wrap">
-        <div>
-          <div className="flex items-center gap-2 mb-1">
-            <Brain size={16} className="text-brand-400" />
-            <span className="font-semibold text-white">{analysis.root_cause}</span>
-            {analysis.is_mock && (
-              <span className="text-[10px] px-1.5 py-0.5 bg-gray-800 text-gray-500 rounded">MOCK</span>
-            )}
-          </div>
-          <p className="text-sm text-gray-400">{analysis.root_cause_detail}</p>
+    <div className="card border-gray-700 space-y-3">
+      <div className="flex items-center justify-between cursor-pointer" onClick={() => collapsible && setOpen(o => !o)}>
+        <div className="flex items-center gap-2">
+          <Brain size={14} className="text-brand-400" />
+          <span className="font-semibold text-white text-sm">{data.root_cause}</span>
+          {data.is_mock && <span className="text-[10px] px-1.5 py-0.5 bg-gray-800 text-gray-500 rounded">MOCK</span>}
         </div>
-        <span className={`text-xs px-2 py-1 rounded border font-medium ${confidenceColor[analysis.confidence] || confidenceColor.Low}`}>
-          {analysis.confidence} Confidence
-        </span>
+        <div className="flex items-center gap-2">
+          <span className={`text-xs px-2 py-0.5 rounded border ${confColor[data.confidence] || confColor.Low}`}>
+            {data.confidence} Confidence
+          </span>
+          {collapsible && (open ? <ChevronUp size={14}/> : <ChevronDown size={14}/>)}
+        </div>
       </div>
 
-      {analysis.confidence_reasoning && (
-        <p className="text-xs text-gray-500 italic flex gap-1.5"><Info size={12} className="shrink-0 mt-0.5" />{analysis.confidence_reasoning}</p>
-      )}
+      {open && (
+        <>
+          {data.root_cause_detail && (
+            <p className="text-sm text-gray-400">{data.root_cause_detail}</p>
+          )}
 
-      {/* Affected Sensors */}
-      {analysis.affected_sensors && Object.keys(analysis.affected_sensors).length > 0 && (
-        <div>
-          <p className="text-xs text-gray-500 uppercase tracking-wide mb-2">Affected Sensors</p>
-          <div className="space-y-1.5">
-            {Object.entries(analysis.affected_sensors).map(([sensor, info]) => {
-              const dev = info.deviation_pct || 0
-              return (
-                <div key={sensor} className="flex items-center gap-2">
-                  <span className="text-xs text-gray-400 w-36 truncate">{sensor.replace(/_/g, ' ')}</span>
-                  <div className="flex-1 bg-gray-800 rounded-full h-1.5">
-                    <div
-                      className={`h-1.5 rounded-full ${Math.abs(dev) > 20 ? 'bg-red-500' : Math.abs(dev) > 10 ? 'bg-orange-500' : 'bg-yellow-500'}`}
-                      style={{ width: `${Math.min(Math.abs(dev), 100)}%` }}
-                    />
+          {actions.length > 0 && (
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide mb-1.5">Actions</p>
+              <div className="space-y-1">
+                {actions.sort((a, b) => (a.priority||9)-(b.priority||9)).map((a, i) => (
+                  <div key={i} className={`flex items-start gap-2 text-xs rounded border px-2.5 py-1.5 ${urgencyColor[a.urgency]||urgencyColor.Monitor}`}>
+                    <Zap size={11} className="shrink-0 mt-0.5"/>
+                    <span className="flex-1">{a.action}</span>
+                    <span className="opacity-70 whitespace-nowrap">{a.urgency}</span>
                   </div>
-                  <span className={`text-xs font-mono w-14 text-right ${dev > 0 ? 'text-red-400' : 'text-blue-400'}`}>
-                    {dev > 0 ? '+' : ''}{dev.toFixed(1)}%
-                  </span>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* Recommendations */}
-      {actions.length > 0 && (
-        <div>
-          <p className="text-xs text-gray-500 uppercase tracking-wide mb-2">Recommended Actions</p>
-          <div className="space-y-1.5">
-            {actions.sort((a, b) => (a.priority || 99) - (b.priority || 99)).map((act, i) => (
-              <div key={i} className={`flex items-start gap-2 text-sm rounded border px-3 py-2 ${urgencyColor[act.urgency] || urgencyColor.Monitor}`}>
-                <Zap size={13} className="shrink-0 mt-0.5" />
-                <div className="flex-1">
-                  <span>{act.action}</span>
-                </div>
-                <span className="text-[10px] font-medium opacity-75 whitespace-nowrap">{act.urgency}</span>
+                ))}
               </div>
-            ))}
-          </div>
-        </div>
-      )}
+            </div>
+          )}
 
-      {/* Time to Critical */}
-      {analysis.time_to_critical && (
-        <div className="flex items-center gap-2 text-sm">
-          <Clock size={14} className="text-orange-400" />
-          <span className="text-gray-400">Time to critical:</span>
-          <span className="text-orange-300 font-medium">{analysis.time_to_critical}</span>
-        </div>
-      )}
+          {data.time_to_critical && (
+            <div className="flex items-center gap-2 text-sm">
+              <Clock size={13} className="text-orange-400"/>
+              <span className="text-gray-400">Time to critical:</span>
+              <span className="text-orange-300 font-medium">{data.time_to_critical}</span>
+            </div>
+          )}
 
-      {analysis.additional_notes && (
-        <p className="text-xs text-gray-600 border-t border-gray-800 pt-3">{analysis.additional_notes}</p>
-      )}
-
-      {analysis.created_at && (
-        <p className="text-[10px] text-gray-600">Analyzed: {analysis.created_at}</p>
+          {data.additional_notes && (
+            <p className="text-xs text-gray-600 border-t border-gray-800 pt-2">{data.additional_notes}</p>
+          )}
+        </>
       )}
     </div>
   )
 }
 
-export default function AgentPanel() {
-  const [loading, setLoading]   = useState(false)
-  const [analysis, setAnalysis] = useState(null)
-  const [history, setHistory]   = useState([])
-  const [error, setError]       = useState(null)
+// ── Chat message bubble ───────────────────────────────────────────────────────
+function ChatBubble({ role, content, streaming }) {
+  const isUser = role === 'user'
+  return (
+    <div className={`flex gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
+      <div className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 mt-0.5 ${isUser ? 'bg-brand-600' : 'bg-gray-700'}`}>
+        {isUser ? <User size={13}/> : <Bot size={13}/>}
+      </div>
+      <div className={`max-w-[80%] rounded-xl px-4 py-3 ${isUser ? 'bg-brand-900/40 border border-brand-800' : 'bg-gray-800 border border-gray-700'}`}>
+        {isUser
+          ? <p className="text-sm text-gray-200">{content}</p>
+          : <Markdown text={content} />
+        }
+        {streaming && <span className="inline-block w-1.5 h-4 bg-brand-400 animate-pulse ml-1 align-bottom" />}
+      </div>
+    </div>
+  )
+}
 
-  const fetchHistory = async () => {
-    try {
-      const data = await getAgentHistory()
-      setHistory(data.analyses || [])
-    } catch {}
-  }
+// ── Main component ────────────────────────────────────────────────────────────
+export default function AgentPanel() {
+  const [phase, setPhase]               = useState('idle')   // idle | streaming | chat
+  const [streamText, setStreamText]     = useState('')
+  const [structured, setStructured]     = useState(null)
+  const [chatMessages, setChatMessages] = useState([])
+  const [chatInput, setChatInput]       = useState('')
+  const [chatLoading, setChatLoading]   = useState(false)
+  const [history, setHistory]           = useState([])
+  const [error, setError]               = useState(null)
+  const [anomalyCtx, setAnomalyCtx]    = useState(null)
+  const chatEndRef                      = useRef(null)
+  const esRef                           = useRef(null)
 
   useEffect(() => { fetchHistory() }, [])
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [chatMessages, streamText])
 
-  const handleAnalyze = async () => {
-    setLoading(true)
-    setError(null)
+  const fetchHistory = async () => {
+    try { const d = await getAgentHistory(); setHistory(d.analyses || []) } catch {}
+  }
+
+  // Build anomaly context from latest prediction
+  const buildContext = async () => {
+    const baselines = {
+      suction_pressure: 1.0, discharge_pressure: 8.75, suction_temperature: 30.0,
+      discharge_temperature: 95.0, vibration_x: 2.25, vibration_y: 2.25,
+      bearing_temperature: 55.0, motor_current: 50.0, flow_rate: 1000.0, oil_pressure: 3.25,
+    }
+    let predData = null
     try {
-      // Get latest anomalous prediction for context
-      let predData = null
-      try {
-        const preds = await getRecentPredictions()
-        predData = (preds.predictions || []).find(p => p.is_anomaly) || preds.predictions?.[0]
-      } catch {}
+      const preds = await getRecentPredictions()
+      predData = (preds.predictions || []).find(p => p.is_anomaly) || preds.predictions?.[0]
+    } catch {}
 
-      const request = {
-        prediction_id: predData?.id || null,
-        anomaly_timestamp: predData?.timestamp || new Date().toISOString(),
-        severity: predData?.severity || 'MEDIUM',
-        affected_sensors: predData?.sensor_values
-          ? Object.entries(predData.sensor_values).reduce((acc, [k, v]) => {
-              const baselines = {
-                suction_pressure: 1.0, discharge_pressure: 8.75, suction_temperature: 30.0,
-                discharge_temperature: 95.0, vibration_x: 2.25, vibration_y: 2.25,
-                bearing_temperature: 55.0, motor_current: 50.0, flow_rate: 1000.0, oil_pressure: 3.25,
-              }
-              const base = baselines[k] || v
-              const devPct = ((v - base) / Math.abs(base)) * 100
-              if (Math.abs(devPct) > 5) {
-                acc[k] = { current: +v.toFixed(3), baseline: base, deviation_pct: +devPct.toFixed(1) }
-              }
-              return acc
-            }, {})
-          : {},
-        anomaly_score: predData?.anomaly_score || 0.6,
-        if_score: predData?.if_score || 0.55,
-        lstm_reconstruction_error: predData?.lstm_error || 0.015,
-        recent_trend: 'Gradual increase in anomaly score over the last 60 minutes',
-        previous_anomalies_24h: history.length,
-      }
+    const affected = predData?.sensor_values
+      ? Object.entries(predData.sensor_values).reduce((acc, [k, v]) => {
+          const base = baselines[k] || v
+          const dev  = ((v - base) / Math.abs(base)) * 100
+          if (Math.abs(dev) > 5) acc[k] = { current: +v.toFixed(3), baseline: base, deviation_pct: +dev.toFixed(1) }
+          return acc
+        }, {})
+      : {}
 
-      const result = await analyzeAnomaly(request)
-      setAnalysis(result)
-      await fetchHistory()
-    } catch (e) {
-      setError(e.response?.data?.detail || e.message)
-    } finally {
-      setLoading(false)
+    return {
+      severity:              predData?.severity || 'MEDIUM',
+      anomaly_score:         predData?.anomaly_score || 0.6,
+      if_score:              predData?.if_score || 0.55,
+      lstm_error:            predData?.lstm_error || 0.015,
+      affected_sensors:      affected,
+      anomaly_timestamp:     predData?.timestamp || new Date().toISOString(),
+      previous_anomalies_24h: history.length,
+      recent_trend:          'Gradual increase in anomaly score over last 60 minutes',
     }
   }
 
+  const handleAnalyze = useCallback(async () => {
+    if (esRef.current) esRef.current.close()
+    setPhase('streaming')
+    setStreamText('')
+    setStructured(null)
+    setChatMessages([])
+    setError(null)
+
+    const ctx = await buildContext()
+    setAnomalyCtx(ctx)
+
+    // Build query string
+    const params = new URLSearchParams({
+      severity:               ctx.severity,
+      anomaly_score:          ctx.anomaly_score,
+      if_score:               ctx.if_score,
+      lstm_error:             ctx.lstm_error,
+      previous_anomalies_24h: ctx.previous_anomalies_24h,
+      recent_trend:           ctx.recent_trend,
+      sensors:                JSON.stringify(ctx.affected_sensors),
+    })
+
+    const es = new EventSource(`/api/agent/stream?${params}`)
+    esRef.current = es
+    let buffer = ''
+
+    es.onmessage = (e) => {
+      try {
+        const { chunk } = JSON.parse(e.data)
+        if (!chunk) return
+
+        if (chunk.startsWith('text:')) {
+          buffer += chunk.slice(5)
+          setStreamText(buffer)
+        } else if (chunk.startsWith('done:')) {
+          const parsed = JSON.parse(chunk.slice(5))
+          setStructured(parsed)
+          // Seed chat with the stream text as assistant's first message
+          setChatMessages([{ role: 'assistant', content: buffer }])
+          setPhase('chat')
+          es.close()
+          fetchHistory()
+        } else if (chunk.startsWith('error:')) {
+          setError(chunk.slice(6))
+          // Still try to get a mock/rule-based analysis via the regular endpoint
+          try {
+            const r = await fetch('/api/agent/analyze', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                severity: ctx.severity,
+                anomaly_score: ctx.anomaly_score,
+                if_score: ctx.if_score,
+                lstm_reconstruction_error: ctx.lstm_error,
+                affected_sensors: ctx.affected_sensors,
+                previous_anomalies_24h: ctx.previous_anomalies_24h,
+              }),
+            })
+            const fallback = await r.json()
+            setStructured(fallback)
+            const fallbackText = `## Root Cause\n${fallback.root_cause}\n\n${fallback.root_cause_detail || ''}\n\n## Recommended Actions\n${(fallback.recommended_actions||[]).map(a => `- [${a.urgency}] ${a.action}`).join('\n')}\n\n## Time to Critical\n${fallback.time_to_critical || 'Unknown'}`
+            setChatMessages([{ role: 'assistant', content: fallbackText }])
+            setPhase('chat')
+          } catch { setPhase('idle') }
+          es.close()
+        }
+      } catch { /* ignore parse errors */ }
+    }
+    es.onerror = () => { es.close(); if (phase === 'streaming') setPhase('idle') }
+  }, [history.length])
+
+  const handleChat = async () => {
+    if (!chatInput.trim() || chatLoading) return
+    const userMsg = { role: 'user', content: chatInput.trim() }
+    const nextMsgs = [...chatMessages, userMsg]
+    setChatMessages(nextMsgs)
+    setChatInput('')
+    setChatLoading(true)
+
+    // Placeholder for streaming assistant reply
+    const placeholderIdx = nextMsgs.length
+    setChatMessages(prev => [...prev, { role: 'assistant', content: '', streaming: true }])
+
+    try {
+      const resp = await fetch('/api/agent/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: nextMsgs,
+          anomaly_context: anomalyCtx || {},
+        }),
+      })
+
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let replyBuf = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const text = decoder.decode(value)
+        // Each SSE line: "data: {...}\n\n"
+        for (const line of text.split('\n')) {
+          if (!line.startsWith('data: ')) continue
+          try {
+            const { chunk } = JSON.parse(line.slice(6))
+            if (!chunk) continue
+            if (chunk.startsWith('text:')) {
+              replyBuf += chunk.slice(5)
+              setChatMessages(prev => {
+                const updated = [...prev]
+                updated[placeholderIdx] = { role: 'assistant', content: replyBuf, streaming: true }
+                return updated
+              })
+            } else if (chunk.startsWith('done:')) {
+              setChatMessages(prev => {
+                const updated = [...prev]
+                updated[placeholderIdx] = { role: 'assistant', content: replyBuf }
+                return updated
+              })
+            }
+          } catch { /* ignore */ }
+        }
+      }
+    } catch (e) {
+      setChatMessages(prev => {
+        const updated = [...prev]
+        updated[placeholderIdx] = { role: 'assistant', content: `Error: ${e.message}` }
+        return updated
+      })
+    } finally {
+      setChatLoading(false)
+    }
+  }
+
+  const handleKeyDown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleChat() } }
+
+  const reset = () => {
+    esRef.current?.close()
+    setPhase('idle'); setStreamText(''); setStructured(null)
+    setChatMessages([]); setChatInput(''); setError(null)
+  }
+
   return (
-    <div className="space-y-5">
+    <div className="space-y-4">
+
+      {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
-        <h2 className="text-2xl font-bold text-white">AI Agent Analysis</h2>
-        <div className="flex gap-3">
+        <div>
+          <h2 className="text-2xl font-bold text-white">AI Agent Analysis</h2>
+          <p className="text-xs text-gray-500 mt-0.5">Powered by Claude {phase === 'chat' ? '· Chat active' : ''}</p>
+        </div>
+        <div className="flex gap-2">
+          {phase !== 'idle' && (
+            <button onClick={reset} className="btn-secondary flex items-center gap-2 text-sm">
+              <Trash2 size={13}/> Reset
+            </button>
+          )}
           <button onClick={fetchHistory} className="btn-secondary flex items-center gap-2 text-sm">
-            <RefreshCw size={14} /> History
+            <RefreshCw size={13}/> History
           </button>
-          <button onClick={handleAnalyze} disabled={loading} className="btn-primary flex items-center gap-2">
-            {loading ? <Loader2 size={16} className="animate-spin" /> : <Brain size={16} />}
-            {loading ? 'Analyzing...' : 'Analyze Latest Anomaly'}
+          <button
+            onClick={handleAnalyze}
+            disabled={phase === 'streaming'}
+            className="btn-primary flex items-center gap-2"
+          >
+            {phase === 'streaming'
+              ? <><Loader2 size={15} className="animate-spin"/> Analyzing…</>
+              : <><Brain size={15}/> {phase === 'chat' ? 'Re-analyze' : 'Analyze Latest Anomaly'}</>
+            }
           </button>
         </div>
-      </div>
-
-      {/* Info about API key */}
-      <div className="card border-gray-800 bg-gray-900/50 text-sm text-gray-500 flex items-start gap-2">
-        <Info size={14} className="shrink-0 mt-0.5 text-brand-400" />
-        <span>
-          Set <code className="bg-gray-800 px-1 rounded text-gray-300">ANTHROPIC_API_KEY</code> environment variable for full Claude AI analysis.
-          Without it, a mock analysis is returned for demonstration.
-        </span>
       </div>
 
       {error && (
-        <div className="card border-red-900 flex items-center gap-3 text-red-400">
-          <AlertTriangle size={18} /> {error}
+        <div className="card border-orange-800 bg-orange-900/10 space-y-2">
+          <div className="flex items-center gap-3 text-orange-400 text-sm">
+            <AlertTriangle size={16} className="shrink-0"/> {error}
+          </div>
+          {error.includes('credits') && (
+            <p className="text-xs text-gray-500 ml-7">
+              Add credits at{' '}
+              <span className="text-brand-400 font-mono">console.anthropic.com → Billing</span>
+              {' '}then click Re-analyze. The fallback rule-based analysis still works below.
+            </p>
+          )}
         </div>
       )}
 
-      {/* Loading state */}
-      {loading && (
-        <div className="card flex items-center gap-4 py-8">
-          <Loader2 size={28} className="animate-spin text-brand-400" />
-          <div>
-            <p className="text-white font-medium">Analyzing anomaly pattern...</p>
-            <p className="text-gray-400 text-sm mt-1">Claude is correlating sensor data and generating diagnosis</p>
-            <div className="flex gap-1 mt-3">
-              {['Correlating sensors', 'Identifying root cause', 'Generating recommendations'].map((s, i) => (
-                <span key={i} className="text-xs bg-gray-800 text-gray-400 px-2 py-0.5 rounded animate-pulse" style={{ animationDelay: `${i * 0.3}s` }}>{s}</span>
-              ))}
+      {/* ── Idle: empty state ── */}
+      {phase === 'idle' && !error && history.length === 0 && (
+        <div className="card text-center py-14 text-gray-500">
+          <Brain size={52} className="mx-auto mb-4 opacity-25"/>
+          <p className="font-medium text-gray-400">Click "Analyze Latest Anomaly" to start</p>
+          <p className="text-sm mt-1">Run the Live Monitor first to generate anomaly data.</p>
+        </div>
+      )}
+
+      {/* ── Streaming: show text as it arrives ── */}
+      {phase === 'streaming' && (
+        <div className="card border-brand-800 bg-gray-900/60 space-y-3">
+          <div className="flex items-center gap-2 text-brand-400 text-sm">
+            <Loader2 size={14} className="animate-spin"/>
+            <span>Claude is analyzing the anomaly pattern…</span>
+          </div>
+          <div className="min-h-32 bg-gray-950 rounded-lg p-4 border border-gray-800">
+            <Markdown text={streamText} />
+            {streamText.length === 0 && (
+              <div className="flex gap-1.5 mt-2">
+                {['Correlating sensors','Identifying root cause','Generating diagnosis'].map((s, i) => (
+                  <span key={i} className="text-xs bg-gray-800 text-gray-500 px-2 py-0.5 rounded animate-pulse"
+                    style={{ animationDelay: `${i * 0.25}s` }}>{s}</span>
+                ))}
+              </div>
+            )}
+            {streamText.length > 0 && (
+              <span className="inline-block w-1.5 h-4 bg-brand-400 animate-pulse ml-0.5 align-bottom" />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Chat mode ── */}
+      {phase === 'chat' && (
+        <div className="space-y-4">
+          {/* Structured summary (collapsible) */}
+          {structured && <StructuredCard data={structured} collapsible />}
+
+          {/* Chat transcript */}
+          <div className="card border-gray-700 space-y-4 max-h-[480px] overflow-y-auto">
+            <p className="text-xs text-gray-500 uppercase tracking-widest sticky top-0 bg-gray-900 pb-1">Conversation</p>
+            {chatMessages.map((m, i) => (
+              <ChatBubble key={i} role={m.role} content={m.content} streaming={m.streaming && i === chatMessages.length - 1} />
+            ))}
+            <div ref={chatEndRef} />
+          </div>
+
+          {/* Chat input */}
+          <div className="card border-gray-700 p-3">
+            <div className="flex gap-2 items-end">
+              <textarea
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Ask a follow-up question… (Enter to send, Shift+Enter for newline)"
+                rows={2}
+                disabled={chatLoading}
+                className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200
+                           placeholder-gray-600 resize-none focus:outline-none focus:border-brand-600"
+              />
+              <button
+                onClick={handleChat}
+                disabled={!chatInput.trim() || chatLoading}
+                className="btn-primary px-3 py-2 flex items-center gap-1.5 shrink-0"
+              >
+                {chatLoading
+                  ? <Loader2 size={15} className="animate-spin"/>
+                  : <Send size={15}/>
+                }
+              </button>
             </div>
+            <p className="text-[10px] text-gray-600 mt-1.5">
+              Ask about root causes, maintenance procedures, risk assessment, or anything about this anomaly.
+            </p>
           </div>
         </div>
       )}
 
-      {/* Latest analysis */}
-      {analysis && !loading && (
-        <div>
-          <div className="flex items-center gap-2 text-green-400 text-sm mb-3">
-            <CheckCircle size={14} /> Latest Analysis
-          </div>
-          <AnalysisCard analysis={analysis} />
-        </div>
-      )}
-
-      {/* History */}
+      {/* ── History ── */}
       {history.length > 0 && (
         <div>
-          <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">Analysis History</h3>
-          <div className="space-y-3">
+          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-3">
+            Analysis History ({history.length})
+          </h3>
+          <div className="space-y-2">
             {history.slice(0, 5).map(h => (
-              <AnalysisCard key={h.id} analysis={h} />
+              <div key={h.id} className="card p-3 border-gray-800 flex items-start justify-between gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <Brain size={12} className="text-brand-400 shrink-0"/>
+                    <p className="text-sm text-white truncate">{h.root_cause}</p>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded border shrink-0 ${confColor[h.confidence]||confColor.Low}`}>
+                      {h.confidence}
+                    </span>
+                  </div>
+                  {h.time_to_critical && (
+                    <p className="text-xs text-gray-500 mt-1 flex items-center gap-1">
+                      <Clock size={10}/> {h.time_to_critical}
+                    </p>
+                  )}
+                </div>
+                {h.created_at && (
+                  <p className="text-[10px] text-gray-600 shrink-0">{h.created_at.slice(0,16)}</p>
+                )}
+              </div>
             ))}
           </div>
-        </div>
-      )}
-
-      {!analysis && !loading && history.length === 0 && (
-        <div className="card text-center py-12 text-gray-500">
-          <Brain size={48} className="mx-auto mb-3 opacity-30" />
-          <p>Click "Analyze Latest Anomaly" to get AI-powered diagnosis.</p>
-          <p className="text-sm mt-1">Works best after running the Live Monitor simulation.</p>
         </div>
       )}
     </div>
