@@ -19,15 +19,6 @@ const NAV_ITEMS = [
 export default function App() {
   const [active, setActive] = useState('dashboard')
 
-  const panels = {
-    dashboard:  <Dashboard />,
-    training:   <TrainingPanel />,
-    evaluation: <EvaluationPanel />,
-    monitor:    <LiveMonitor />,
-    timeline:   <AnomalyTimeline />,
-    agent:      <AgentPanel />,
-  }
-
   return (
     <div className="min-h-screen flex flex-col">
       {/* Header */}
@@ -71,9 +62,14 @@ export default function App() {
           </div>
         </aside>
 
-        {/* Main content */}
+        {/* Main content — all panels stay mounted; only active one is visible */}
         <main className="flex-1 overflow-y-auto p-6">
-          {panels[active]}
+          <div style={{ display: active === 'dashboard'  ? 'block' : 'none' }}><Dashboard /></div>
+          <div style={{ display: active === 'training'   ? 'block' : 'none' }}><TrainingPanel /></div>
+          <div style={{ display: active === 'evaluation' ? 'block' : 'none' }}><EvaluationPanel /></div>
+          <div style={{ display: active === 'monitor'    ? 'block' : 'none' }}><LiveMonitor /></div>
+          <div style={{ display: active === 'timeline'   ? 'block' : 'none' }}><AnomalyTimeline /></div>
+          <div style={{ display: active === 'agent'      ? 'block' : 'none' }}><AgentPanel /></div>
         </main>
       </div>
     </div>

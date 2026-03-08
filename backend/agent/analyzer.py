@@ -60,6 +60,21 @@ Affected Sensors (those deviating >5% from baseline):
 
 Provide your engineering diagnosis as a JSON object."""
 
+STREAM_USER_PROMPT_TEMPLATE = """Analyze this compressor anomaly detection alert:
+
+Timestamp: {anomaly_timestamp}
+Severity: {severity}
+Ensemble Anomaly Score: {anomaly_score:.3f}
+Isolation Forest Score: {if_score:.3f}
+LSTM Reconstruction Error: {lstm_reconstruction_error:.4f}
+Previous anomalies in last 24h: {previous_anomalies_24h}
+Recent trend (60 min): {recent_trend}
+
+Affected Sensors (those deviating >5% from baseline):
+{affected_sensors_text}
+
+Provide a structured engineering diagnosis using the markdown format specified."""
+
 
 def _format_affected_sensors(affected_sensors: Dict[str, Dict]) -> str:
     if not affected_sensors:
@@ -175,8 +190,8 @@ def stream_analyze_anomaly(anomaly_data: Dict[str, Any]) -> Generator[str, None,
         for a in mock["recommended_actions"]:
             text += f"- [{a['urgency'].upper()}] {a['action']}\n"
         text += f"\n## Time to Critical\n{mock['time_to_critical']}"
-        for ch in text:
-            yield f"text:{ch}"
+        for word in text.split(" "):
+            yield f"text:{word} "
         yield f"done:{json.dumps(mock)}"
         return
 
@@ -185,7 +200,7 @@ def stream_analyze_anomaly(anomaly_data: Dict[str, Any]) -> Generator[str, None,
         client = anthropic.Anthropic(api_key=api_key)
 
         affected_text = _format_affected_sensors(affected_sensors)
-        user_msg = USER_PROMPT_TEMPLATE.format(
+        user_msg = STREAM_USER_PROMPT_TEMPLATE.format(
             anomaly_timestamp=anomaly_data.get("anomaly_timestamp", datetime.utcnow().isoformat()),
             severity=severity,
             anomaly_score=anomaly_data.get("anomaly_score", 0.0),

@@ -132,9 +132,23 @@ export default function AgentPanel() {
   const [anomalyCtx, setAnomalyCtx]    = useState(null)
   const chatEndRef                      = useRef(null)
   const esRef                           = useRef(null)
+  const scrollContainerRef              = useRef(null)
+  const userScrolledRef                 = useRef(false)
 
   useEffect(() => { fetchHistory() }, [])
-  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [chatMessages, streamText])
+
+  // Auto-scroll to bottom unless user has manually scrolled up
+  useEffect(() => {
+    if (userScrolledRef.current) return
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [chatMessages, streamText])
+
+  const handleConversationScroll = () => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    // Consider user "scrolled up" if more than 40px from the bottom
+    userScrolledRef.current = el.scrollHeight - el.scrollTop - el.clientHeight > 40
+  }
 
   const fetchHistory = async () => {
     try { const d = await getAgentHistory(); setHistory(d.analyses || []) } catch {}
@@ -176,6 +190,7 @@ export default function AgentPanel() {
 
   const handleAnalyze = useCallback(async () => {
     if (esRef.current) esRef.current.close()
+    userScrolledRef.current = false
     setPhase('streaming')
     setStreamText('')
     setStructured(null)
@@ -199,6 +214,13 @@ export default function AgentPanel() {
     const es = new EventSource(`/api/agent/stream?${params}`)
     esRef.current = es
     let buffer = ''
+    let rafId = null
+
+    // Batch DOM updates via requestAnimationFrame for smooth rendering
+    const flushBuffer = (text) => {
+      if (rafId) cancelAnimationFrame(rafId)
+      rafId = requestAnimationFrame(() => setStreamText(text))
+    }
 
     es.onmessage = async (e) => {
       try {
@@ -207,7 +229,7 @@ export default function AgentPanel() {
 
         if (chunk.startsWith('text:')) {
           buffer += chunk.slice(5)
-          setStreamText(buffer)
+          flushBuffer(buffer)
         } else if (chunk.startsWith('done:')) {
           const parsed = JSON.parse(chunk.slice(5))
           setStructured(parsed)
@@ -242,7 +264,7 @@ export default function AgentPanel() {
         }
       } catch { /* ignore parse errors */ }
     }
-    es.onerror = () => { es.close(); if (phase === 'streaming') setPhase('idle') }
+    es.onerror = () => { if (rafId) cancelAnimationFrame(rafId); es.close(); if (phase === 'streaming') setPhase('idle') }
   }, [history.length])
 
   const handleChat = async () => {
@@ -313,6 +335,7 @@ export default function AgentPanel() {
 
   const reset = () => {
     esRef.current?.close()
+    userScrolledRef.current = false
     setPhase('idle'); setStreamText(''); setStructured(null)
     setChatMessages([]); setChatInput(''); setError(null)
   }
@@ -398,12 +421,16 @@ export default function AgentPanel() {
 
       {/* ── Chat mode ── */}
       {phase === 'chat' && (
-        <div className="space-y-4">
+        <div className="flex flex-col gap-3" style={{ height: 'calc(100vh - 240px)', minHeight: '400px' }}>
           {/* Structured summary (collapsible) */}
-          {structured && <StructuredCard data={structured} collapsible />}
+          {structured && <div className="shrink-0"><StructuredCard data={structured} collapsible /></div>}
 
-          {/* Chat transcript */}
-          <div className="card border-gray-700 space-y-4 max-h-[480px] overflow-y-auto">
+          {/* Chat transcript — fills remaining height, scrolls internally */}
+          <div
+            ref={scrollContainerRef}
+            onScroll={handleConversationScroll}
+            className="card border-gray-700 flex-1 min-h-0 overflow-y-auto space-y-4"
+          >
             <p className="text-xs text-gray-500 uppercase tracking-widest sticky top-0 bg-gray-900 pb-1">Conversation</p>
             {chatMessages.map((m, i) => (
               <ChatBubble key={i} role={m.role} content={m.content} streaming={m.streaming && i === chatMessages.length - 1} />
@@ -411,8 +438,8 @@ export default function AgentPanel() {
             <div ref={chatEndRef} />
           </div>
 
-          {/* Chat input */}
-          <div className="card border-gray-700 p-3">
+          {/* Chat input — pinned at the bottom, never scrolls away */}
+          <div className="card border-gray-700 p-3 shrink-0">
             <div className="flex gap-2 items-end">
               <textarea
                 value={chatInput}
