@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+backend/venv/
+venv/
+env/
+
+# Trained model binaries (large files — retrain locally)
+backend/saved_models/*.pkl
+backend/saved_models/*.keras
+# Keep the threshold JSON (small, important for deployment)
+!backend/saved_models/optimal_threshold.json
+
+# Data (potentially large/sensitive)
+backend/data/sample_data.csv
+
+# Database
+backend/*.db
+backend/**/*.db
+
+# Environment variables
+.env
+*.env
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+.claude/
